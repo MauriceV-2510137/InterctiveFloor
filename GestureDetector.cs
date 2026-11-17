@@ -4,77 +4,117 @@ using System.Collections.Generic;
 
 namespace Microsoft.Samples.Kinect.ControlsBasics
 {
-    /// <summary>
-    /// Two custom skeleton gestures:
-    ///  "HandsUp" - both hands above the head for 0.25 s
-    ///  "Swipe"   - right hand moves sideways > 0.45 m within 0.5 s (hand above hip)
-    /// </summary>
+    public static class GestureNames
+    {
+        public const string HandsUp = "HandsUp";
+        public const string Swipe = "Swipe";
+    }
+
+    /// <summary>Runs all gestures against each skeleton frame and raises an event when one fires.</summary>
     public class GestureDetector
     {
+        private readonly Gesture[] gestures = { new HandsUpGesture(), new SwipeGesture() };
+
         public event Action<string> GestureDetected;
 
-        private readonly List<KeyValuePair<DateTime, SkeletonPoint>> m_rightHand = new List<KeyValuePair<DateTime, SkeletonPoint>>();
-        private DateTime? m_handsUpSince = null;
-        private DateTime m_lastHandsUp = DateTime.MinValue;
-        private DateTime m_lastSwipe = DateTime.MinValue;
-
-        private static readonly TimeSpan HandsUpHold = TimeSpan.FromMilliseconds(250);
-        private static readonly TimeSpan SwipeWindow = TimeSpan.FromMilliseconds(500);
-        private static readonly TimeSpan Cooldown = TimeSpan.FromMilliseconds(1500);
-        private const double SwipeDistance = 0.45; //meters
-        private const double SwipeMaxVertical = 0.25;
-
-        private static bool Ok(Joint j) { return j.TrackingState == JointTrackingState.Tracked; }
-
-        public void Update(Skeleton sk)
+        public void Update(Skeleton skeleton)
         {
             DateTime now = DateTime.UtcNow;
-            Joint head = sk.Joints[JointType.Head];
-            Joint lh = sk.Joints[JointType.HandLeft];
-            Joint rh = sk.Joints[JointType.HandRight];
-            Joint hip = sk.Joints[JointType.HipCenter];
-
-            // --- gesture 1: both hands above head ---
-            bool up = Ok(head) && Ok(lh) && Ok(rh)
-                      && lh.Position.Y > head.Position.Y && rh.Position.Y > head.Position.Y;
-            if (up)
-            {
-                if (m_handsUpSince == null) m_handsUpSince = now;
-                else if (now - m_handsUpSince.Value > HandsUpHold && now - m_lastHandsUp > Cooldown)
-                {
-                    m_lastHandsUp = now;
-                    Raise("HandsUp");
-                }
-            }
-            else m_handsUpSince = null;
-
-            // --- gesture 2: right hand horizontal swipe ---
-            if (Ok(rh) && Ok(hip) && rh.Position.Y > hip.Position.Y)
-            {
-                m_rightHand.Add(new KeyValuePair<DateTime, SkeletonPoint>(now, rh.Position));
-                while (m_rightHand.Count > 0 && now - m_rightHand[0].Key > SwipeWindow)
-                    m_rightHand.RemoveAt(0);
-
-                if (m_rightHand.Count > 1 && now - m_lastSwipe > Cooldown)
-                {
-                    SkeletonPoint first = m_rightHand[0].Value;
-                    double dx = rh.Position.X - first.X;
-                    double dy = rh.Position.Y - first.Y;
-                    if (Math.Abs(dx) > SwipeDistance && Math.Abs(dy) < SwipeMaxVertical)
-                    {
-                        m_lastSwipe = now;
-                        m_rightHand.Clear();
-                        Raise("Swipe");
-                    }
-                }
-            }
-            else m_rightHand.Clear();
+            foreach (Gesture gesture in gestures)
+                if (gesture.Update(skeleton, now))
+                    GestureDetected?.Invoke(gesture.Name);
         }
+    }
 
-        private void Raise(string name)
+    /// <summary>Base class: subclasses only say "is the gesture happening right now"; cooldown is handled here.</summary>
+    public abstract class Gesture
+    {
+        private DateTime lastFired = DateTime.MinValue;
+
+        public abstract string Name { get; }
+
+        protected virtual TimeSpan Cooldown { get { return TimeSpan.FromMilliseconds(1500); } }
+
+        public bool Update(Skeleton skeleton, DateTime now)
         {
-            Action<string> h = GestureDetected;
-            if (h != null) h(name);
+            bool detected = Detect(skeleton, now);
+            if (!detected || now - lastFired < Cooldown) return false;
+
+            lastFired = now;
+            OnFired();
+            return true;
         }
+
+        protected abstract bool Detect(Skeleton skeleton, DateTime now);
+
+        protected virtual void OnFired() { }
+
+        protected static bool IsTracked(Joint joint)
+        {
+            return joint.TrackingState == JointTrackingState.Tracked;
+        }
+    }
+
+    /// <summary>Both hands above the head for 0.25 s.</summary>
+    public class HandsUpGesture : Gesture
+    {
+        private static readonly TimeSpan HoldTime = TimeSpan.FromMilliseconds(250);
+        private DateTime? handsUpSince;
+
+        public override string Name { get { return GestureNames.HandsUp; } }
+
+        protected override bool Detect(Skeleton skeleton, DateTime now)
+        {
+            Joint head = skeleton.Joints[JointType.Head];
+            Joint left = skeleton.Joints[JointType.HandLeft];
+            Joint right = skeleton.Joints[JointType.HandRight];
+
+            bool handsUp = IsTracked(head) && IsTracked(left) && IsTracked(right)
+                           && left.Position.Y > head.Position.Y
+                           && right.Position.Y > head.Position.Y;
+            if (!handsUp)
+            {
+                handsUpSince = null;
+                return false;
+            }
+
+            if (handsUpSince == null) handsUpSince = now;
+            return now - handsUpSince.Value > HoldTime;
+        }
+    }
+
+    /// <summary>Right hand (above the hip) moves sideways more than 0.45 m within 0.5 s.</summary>
+    public class SwipeGesture : Gesture
+    {
+        private const double MinDistance = 0.45;  // meters, horizontal
+        private const double MaxDrift = 0.25;     // meters, vertical
+        private static readonly TimeSpan Window = TimeSpan.FromMilliseconds(500);
+
+        private readonly List<KeyValuePair<DateTime, SkeletonPoint>> history = new List<KeyValuePair<DateTime, SkeletonPoint>>();
+
+        public override string Name { get { return GestureNames.Swipe; } }
+
+        protected override bool Detect(Skeleton skeleton, DateTime now)
+        {
+            Joint hand = skeleton.Joints[JointType.HandRight];
+            Joint hip = skeleton.Joints[JointType.HipCenter];
+
+            if (!IsTracked(hand) || !IsTracked(hip) || hand.Position.Y <= hip.Position.Y)
+            {
+                history.Clear();
+                return false;
+            }
+
+            history.Add(new KeyValuePair<DateTime, SkeletonPoint>(now, hand.Position));
+            history.RemoveAll(h => now - h.Key > Window);
+            if (history.Count < 2) return false;
+
+            SkeletonPoint start = history[0].Value;
+            double dx = hand.Position.X - start.X;
+            double dy = hand.Position.Y - start.Y;
+            return Math.Abs(dx) > MinDistance && Math.Abs(dy) < MaxDrift;
+        }
+
+        protected override void OnFired() { history.Clear(); }
     }
 }
